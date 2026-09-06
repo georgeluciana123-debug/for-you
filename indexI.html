@@ -1,0 +1,248 @@
+const canvas = document.getElementById('flower');
+const ctx = canvas.getContext('2d');
+
+let width, height, dpr;
+
+function resize() {
+  dpr = window.devicePixelRatio || 1;
+  width = window.innerWidth;
+  height = window.innerHeight;
+  canvas.width = width * dpr;
+  canvas.height = height * dpr;
+  canvas.style.width = width + 'px';
+  canvas.style.height = height + 'px';
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+}
+window.addEventListener('resize', resize);
+resize();
+
+// ---------- Helpers to build point clouds ----------
+
+// Filled flower shape: a rose curve (petals) sampled with interior scatter,
+// plus a small circular center for the seed/pistil.
+function flowerFilledPoints(count, scale) {
+  const pts = [];
+  const petals = 5; // number of petals
+  const k = petals; // for r = cos(k*theta) rose curve with odd petal count
+  let attempts = 0;
+
+  // reserve some points for the center disk
+  const centerCount = Math.floor(count * 0.12);
+  const petalCount = count - centerCount;
+
+  while (pts.length < petalCount && attempts < petalCount * 60) {
+    attempts++;
+    const theta = Math.random() * Math.PI * 2;
+    const maxR = Math.cos(k * theta);
+    if (maxR <= 0) continue; // outside a petal lobe at this angle
+    // random radius inside the petal boundary, biased slightly outward for fuller look
+    const r = Math.sqrt(Math.random()) * maxR;
+    const x = r * Math.cos(theta) * 20;
+    const y = r * Math.sin(theta) * 20;
+    pts.push({ x: x * scale, y: y * scale });
+  }
+
+  // center disk
+  for (let i = 0; i < centerCount; i++) {
+    const ang = Math.random() * Math.PI * 2;
+    const rad = Math.sqrt(Math.random()) * 3.2;
+    pts.push({ x: Math.cos(ang) * rad * scale, y: Math.sin(ang) * rad * scale });
+  }
+
+  return pts;
+}
+
+// Render text to an offscreen canvas and sample points from opaque pixels
+function textPoints(text, count, fontSize, fontFamily) {
+  const off = document.createElement('canvas');
+  const octx = off.getContext('2d');
+  const w = Math.max(400, text.length * fontSize * 0.7);
+  const h = fontSize * 2;
+  off.width = w;
+  off.height = h;
+  octx.fillStyle = '#fff';
+  octx.font = `bold ${fontSize}px ${fontFamily}`;
+  octx.textAlign = 'center';
+  octx.textBaseline = 'middle';
+  octx.fillText(text, w / 2, h / 2);
+
+  const data = octx.getImageData(0, 0, w, h).data;
+  const candidates = [];
+  const step = 2;
+  for (let y = 0; y < h; y += step) {
+    for (let x = 0; x < w; x += step) {
+      const idx = (y * w + x) * 4;
+      if (data[idx + 3] > 128) {
+        candidates.push({ x: x - w / 2, y: y - h / 2 });
+      }
+    }
+  }
+
+  const pts = [];
+  for (let i = 0; i < count; i++) {
+    const c = candidates[Math.floor(Math.random() * candidates.length)];
+    if (c) pts.push({ x: c.x, y: c.y });
+  }
+  return pts;
+}
+
+// ---------- Particle system ----------
+
+const PARTICLE_COUNT = 1400;
+
+class Particle {
+  constructor(home) {
+    this.home = home;
+    this.x = (Math.random() - 0.5) * width * 1.5;
+    this.y = (Math.random() - 0.5) * height * 1.5;
+    this.vx = 0;
+    this.vy = 0;
+    this.size = 1.2 + Math.random() * 2.2;
+    this.hueShift = Math.random() * 40 - 20;
+    this.target = home; // the "base" target (unscaled)
+  }
+
+  update(ease, friction, pulse) {
+    const tx = this.target.x * pulse;
+    const ty = this.target.y * pulse;
+    const dx = tx - this.x;
+    const dy = ty - this.y;
+    this.vx += dx * ease;
+    this.vy += dy * ease;
+    this.vx *= friction;
+    this.vy *= friction;
+    this.x += this.vx;
+    this.y += this.vy;
+  }
+}
+
+let particles = [];
+let flowerSet = [];
+let textSet = [];
+
+function buildSets() {
+  const baseScale = Math.min(width, height) / 46;
+  flowerSet = flowerFilledPoints(PARTICLE_COUNT, baseScale);
+
+  const fontSize = Math.min(width, height) * 0.1;
+  textSet = textPoints('GOODNIGHT MI AMORE', PARTICLE_COUNT, fontSize, 'Georgia, serif');
+
+  // make sure both sets have exactly PARTICLE_COUNT points
+  while (flowerSet.length < PARTICLE_COUNT) flowerSet.push(flowerSet[flowerSet.length % flowerSet.length] || { x: 0, y: 0 });
+  while (textSet.length < PARTICLE_COUNT) textSet.push(textSet[Math.floor(Math.random() * textSet.length)] || { x: 0, y: 0 });
+
+  if (particles.length === 0) {
+    for (let i = 0; i < PARTICLE_COUNT; i++) {
+      particles.push(new Particle(flowerSet[i]));
+    }
+  } else {
+    for (let i = 0; i < PARTICLE_COUNT; i++) {
+      particles[i].home = flowerSet[i];
+    }
+  }
+}
+
+buildSets();
+window.addEventListener('resize', () => {
+  resize();
+  buildSets();
+});
+
+// ---------- Animation state machine ----------
+// phases: forming flower -> hold -> gentle sway -> morph to text -> hold -> morph back
+
+let phase = 'formFlower';
+let phaseStart = performance.now();
+const DURATIONS = {
+  formFlower: 1800,
+  holdFlower: 900,
+  sway: 2000,
+  toText: 1800,
+  holdText: 2800,
+  toFlower: 1800,
+};
+
+function setTargets(set) {
+  for (let i = 0; i < PARTICLE_COUNT; i++) {
+    particles[i].target = set[i];
+  }
+}
+
+function centerOffset() {
+  return { cx: width / 2, cy: height / 2 };
+}
+
+function draw(now) {
+  const elapsed = now - phaseStart;
+  const { cx, cy } = centerOffset();
+
+  // phase transitions
+  if (phase === 'formFlower' && elapsed > DURATIONS.formFlower) {
+    phase = 'holdFlower';
+    phaseStart = now;
+  } else if (phase === 'holdFlower' && elapsed > DURATIONS.holdFlower) {
+    phase = 'sway';
+    phaseStart = now;
+  } else if (phase === 'sway' && elapsed > DURATIONS.sway) {
+    setTargets(textSet);
+    phase = 'toText';
+    phaseStart = now;
+  } else if (phase === 'toText' && elapsed > DURATIONS.toText) {
+    phase = 'holdText';
+    phaseStart = now;
+  } else if (phase === 'holdText' && elapsed > DURATIONS.holdText) {
+    setTargets(flowerSet);
+    phase = 'toFlower';
+    phaseStart = now;
+  } else if (phase === 'toFlower' && elapsed > DURATIONS.toFlower) {
+    phase = 'holdFlower';
+    phaseStart = now;
+  }
+
+  // gentle breathing scale + slow rotation during 'sway' phase
+  let pulse = 1;
+  let rotation = 0;
+  if (phase === 'sway') {
+    const t = elapsed / DURATIONS.sway;
+    pulse = 1 + Math.sin(t * Math.PI * 2) * 0.05;
+    rotation = Math.sin(t * Math.PI * 2) * 0.12;
+  }
+
+  ctx.fillStyle = 'rgba(0, 0, 0, 0.22)';
+  ctx.fillRect(0, 0, width, height);
+
+  const ease = 0.045;
+  const friction = 0.82;
+  const cosR = Math.cos(rotation);
+  const sinR = Math.sin(rotation);
+
+  for (let i = 0; i < particles.length; i++) {
+    const p = particles[i];
+    p.update(ease, friction, pulse);
+
+    // apply gentle rotation only for display during sway (keeps physics target stable)
+    let dx = p.x, dy = p.y;
+    if (phase === 'sway') {
+      dx = p.x * cosR - p.y * sinR;
+      dy = p.x * sinR + p.y * cosR;
+    }
+
+    const px = cx + dx;
+    const py = cy + dy;
+
+    // moonlit blue-lavender palette
+    const hue = 220 + p.hueShift;
+    ctx.beginPath();
+    ctx.fillStyle = `hsl(${hue}, 70%, ${65 + Math.random() * 15}%)`;
+    ctx.arc(px, py, p.size, 0, Math.PI * 2);
+    ctx.fill();
+  }
+
+  requestAnimationFrame(draw);
+}
+
+// initial fill
+ctx.fillStyle = '#000';
+ctx.fillRect(0, 0, width, height);
+
+requestAnimationFrame(draw);
